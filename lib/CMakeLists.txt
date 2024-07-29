@@ -78,7 +78,7 @@ generate_export_header(${PROJECT_NAME}
   )
 
 set(public_header_files
-  ${CMAKE_SOURCE_DIR}/lib/include/kalign/kalign.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/kalign/kalign.h
   ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}/${PROJECT_NAME}_export.h
   #${CMAKE_CURRENT_SOURCE_DIR}/${PROJECT_NAME}/${PROJECT_NAME}_export.h
   )
