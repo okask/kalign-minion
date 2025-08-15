@@ -1,0 +1,226 @@
+name: Build Python Wheels
+
+on:
+  push:
+    branches: [ main, python ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'python-kalign/**'
+      - 'lib/**'
+      - 'CMakeLists.txt'
+      - 'pyproject.toml'
+      - '.github/workflows/wheels.yml'
+  workflow_dispatch:
+
+jobs:
+  build_wheels:
+    name: Build wheels on ${{ matrix.os }} (${{ matrix.cibw_archs }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cibw_archs: "x86_64"
+          - os: macos-latest
+            cibw_archs: "x86_64"
+          - os: macos-latest
+            cibw_archs: "arm64"
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install cibuildwheel build
+
+    - name: Build wheels
+      env:
+        CIBW_BUILD: cp39-* cp310-* cp311-* cp312-* cp313-*
+        CIBW_SKIP: "*-win32 *-manylinux_i686 *-musllinux*"
+        CIBW_ARCHS: ${{ matrix.cibw_archs }}
+        # Set minimum macOS version to match OpenMP requirements
+        CIBW_ENVIRONMENT_MACOS: >
+          CMAKE_BUILD_PARALLEL_LEVEL=2
+          OMP_NUM_THREADS=1
+          MACOSX_DEPLOYMENT_TARGET=14.0
+          CMAKE_OSX_DEPLOYMENT_TARGET=14.0
+        
+        # Linux specific settings - handle different package managers
+        CIBW_BEFORE_ALL_LINUX: >
+          (yum install -y cmake3) ||
+          (apt-get update && apt-get install -y cmake) ||
+          (apk add --no-cache cmake)
+        CIBW_REPAIR_WHEEL_COMMAND_LINUX: auditwheel repair -w {dest_dir} {wheel}
+        
+        # macOS specific settings  
+        CIBW_BEFORE_ALL_MACOS: |
+          brew install --formula cmake libomp || echo "Dependencies may already be installed"
+        CIBW_REPAIR_WHEEL_COMMAND_MACOS: >
+          delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}
+        
+        # Environment variables for builds
+        CIBW_ENVIRONMENT: >
+          CMAKE_BUILD_PARALLEL_LEVEL=2
+          OMP_NUM_THREADS=1
+          
+        # Skip testing during wheel build to avoid cross-compilation issues
+        CIBW_TEST_SKIP: "*"
+          
+      run: |
+        python -m cibuildwheel --output-dir wheelhouse
+
+    - name: Upload wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: cibw-wheels-${{ matrix.os }}-${{ strategy.job-index }}
+        path: wheelhouse/*.whl
+
+  build_sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install build
+
+    - name: Build sdist
+      run: |
+        python -m build --sdist --outdir dist/
+
+    - name: Upload sdist
+      uses: actions/upload-artifact@v4
+      with:
+        name: cibw-sdist
+        path: dist/*.tar.gz
+
+  test_install:
+    name: Test wheel installation
+    needs: [build_wheels]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+
+    steps:
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Download wheels
+      uses: actions/download-artifact@v4
+      with:
+        pattern: cibw-wheels-*
+        merge-multiple: true
+        path: wheelhouse/
+
+    - name: Test installation and import
+      run: |
+        # Let pip find and install the appropriate wheel
+        echo "=== Available wheels ==="
+        ls -la wheelhouse/*.whl
+        
+        echo "=== Installing wheel ==="
+        pip install --find-links wheelhouse/ kalign --force-reinstall
+        
+        # Check what got installed
+        echo "=== Checking installed packages ==="
+        pip list | grep kalign || true
+        
+        # Check the kalign module structure
+        echo "=== Checking kalign module ==="
+        python -c "
+        import sys
+        print('Python version:', sys.version)
+        print('Attempting to import kalign...')
+        try:
+            import kalign
+            print('✓ kalign imported successfully')
+            print('kalign location:', kalign.__file__)
+            import os
+            kalign_dir = os.path.dirname(kalign.__file__)
+            print('kalign dir contents:', sorted(os.listdir(kalign_dir)))
+            
+            # Check for _core specifically
+            core_files = [f for f in os.listdir(kalign_dir) if '_core' in f]
+            print('_core files found:', core_files)
+        except ImportError as e:
+            print('✗ Import failed:', str(e))
+            import os
+            import site
+            print('Site packages:', site.getsitepackages())
+            for site_dir in site.getsitepackages():
+                kalign_path = os.path.join(site_dir, 'kalign')
+                if os.path.exists(kalign_path):
+                    print(f'Found kalign at {kalign_path}')
+                    print('Contents:', sorted(os.listdir(kalign_path)))
+                    break
+            sys.exit(1)
+        "
+        
+        # Test the installation
+        python -c "
+        import kalign
+        print('kalign version:', kalign.__version__)
+        
+        # Test basic functionality
+        sequences = ['ATCGATCG', 'ATCGTCG', 'ATCGATCG']
+        aligned = kalign.align(sequences, seq_type='dna')
+        print('Number of aligned sequences:', len(aligned))
+        print('Alignment lengths:', [len(seq) for seq in aligned])
+        assert len(aligned) == 3
+        assert all(len(seq) == len(aligned[0]) for seq in aligned)
+        print('✓ Basic alignment test passed')
+        
+        # Test with different sequence types
+        protein_seqs = ['MKTAYIAKQRQ', 'MKTAYIAKQ', 'MKTAYIAK'] 
+        aligned_proteins = kalign.align(protein_seqs, seq_type='protein')
+        print('✓ Protein alignment test passed')
+        
+        print('All tests passed successfully!')
+        "
+
+  upload_pypi:
+    name: Upload to PyPI
+    needs: [build_wheels, build_sdist, test_install]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        pattern: cibw-*
+        merge-multiple: true
+        path: dist/
+
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        user: __token__
+        password: ${{ secrets.PYPI_API_TOKEN }}
+        packages_dir: dist/
